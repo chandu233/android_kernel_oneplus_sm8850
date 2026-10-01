@@ -700,6 +700,7 @@ struct dwc3_msm {
 
 	struct typec_retimer	*retimer;
 	bool			disable_xhci_runtime_pm;
+	bool			oplus_revision_workaround;
 };
 
 #define USB_HSPHY_3P3_VOL_MIN		3050000 /* uV */
@@ -4559,6 +4560,10 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc, bool force_power_collapse)
 	if (mdwc->dwc3)
 		dwc = platform_get_drvdata(mdwc->dwc3);
 
+	/* Opt in only on boards requiring the Find X9 Ultra revision workaround. */
+	if (dwc && mdwc->oplus_revision_workaround)
+		dwc->revision = DWC31_REVISION_200A;
+
 	msm_dwc3_perf_vote_enable(mdwc, false);
 
 	ret = dwc3_msm_check_suspend(mdwc);
@@ -7062,6 +7067,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mdwc);
 	mdwc->dev = &pdev->dev;
+	mdwc->oplus_revision_workaround =
+		of_property_read_bool(node, "oplus,force-dwc31-revision");
 
 	if ((of_device_is_compatible(dev->of_node, "qcom,dwc3-msm-fw-managed"))) {
 		mdwc->fw_managed_pwr = true;
@@ -7857,6 +7864,8 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 		}
 
 		vbus_regulator_toggle(mdwc, false);
+		if (mdwc->oplus_revision_workaround)
+			dwc->revision = DWC31_REVISION_180A;
 		ret = pm_runtime_resume_and_get(&mdwc->dwc3->dev);
 		if (ret < 0) {
 			dev_err(mdwc->dev, "%s: pm_runtime_resume_and_get failed\n", __func__);
