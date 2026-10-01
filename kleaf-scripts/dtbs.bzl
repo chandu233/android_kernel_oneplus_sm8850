@@ -9,6 +9,7 @@ def define_qcom_dtb_setup():
         name = "kconfig.dtb.generated",
         srcs = [
             ":kconfig.msm.generated",
+            "//{}/oplus/bazel:kconfig.oplus.generated".format(SOC_MODULES_REPO_PATH),
             "//{}/oplus/kernel/charger/bazel:kconfig.oplus_chg.generated".format(SOC_MODULES_REPO_PATH),
         ],
         outs = ["dtb/Kconfig.ext"],
