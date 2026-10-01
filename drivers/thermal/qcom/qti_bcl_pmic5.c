@@ -18,6 +18,8 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/ipc_logging.h>
 #include <linux/power_supply.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include "thermal_zone_internal.h"
 #include "qti_bcl_common.h"
 
@@ -143,17 +145,32 @@ struct bcl_desc {
 /* OPlus tables contain a temperature (deci-Celsius) and three limits (mV). */
 struct bcl_vbat_range {
 	s32 temp;
-	u32 mv[REG_MAX];
+	s32 mv[REG_MAX];
 };
 
 struct bcl_dynamic_vbat {
 	struct bcl_device *bcl;
 	struct notifier_block psy_nb;
 	struct work_struct work;
+	struct delayed_work manual_restore_work;
+	struct delayed_work auto_restore_work;
+	struct proc_dir_entry *proc_entry;
+	u32 manual_restore_delay_ms;
+	u32 auto_restore_delay_ms;
+	bool manual_triggered;
+	bool auto_triggered;
 	int num_ranges;
+	int num_compensation;
 	int current_range;
-	struct bcl_vbat_range ranges[];
+	int applied_mv[REG_MAX];
+	struct bcl_vbat_range *ranges;
+	struct bcl_vbat_range *backup;
+	struct bcl_vbat_range *compensation;
 };
+
+static DEFINE_MUTEX(bcl_proc_lock);
+static struct proc_dir_entry *bcl_proc_root;
+static unsigned int bcl_proc_users;
 
 /* A PMIC with its own OPlus table must not follow another PMIC's limits. */
 static bool bcl_owns_vbat_thresholds(struct bcl_device *bcl)
@@ -638,44 +655,76 @@ static int bcl_set_adc_value(struct bcl_device *bcl_perph,
 	return ret;
 }
 
+static int bcl_vbat_range_index(const struct bcl_vbat_range *ranges,
+				int count, int temp)
+{
+	int range;
+
+	for (range = 0; range < count - 1; range++)
+		if (temp <= ranges[range].temp)
+			break;
+	return range;
+}
+
 static void bcl_dynamic_vbat_work(struct work_struct *work)
 {
 	struct bcl_dynamic_vbat *dynamic =
 		container_of(work, struct bcl_dynamic_vbat, work);
 	struct bcl_device *bcl = dynamic->bcl;
 	struct power_supply *psy;
-	union power_supply_propval temp;
-	int range, i, val, ret;
+	union power_supply_propval temp, cycles;
+	int range, i, val, ret, compensation = 0;
+	int mv[REG_MAX];
 
 	psy = power_supply_get_by_name("battery");
 	if (!psy)
 		return;
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &temp);
+	if (!ret && dynamic->compensation &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_CYCLE_COUNT, &cycles) &&
+	    cycles.intval >= 200) {
+		int column = cycles.intval >= 1000 ? 2 : cycles.intval >= 500 ? 1 : 0;
+
+		range = bcl_vbat_range_index(dynamic->compensation,
+					    dynamic->num_compensation, temp.intval);
+		compensation = dynamic->compensation[range].mv[column];
+	}
 	power_supply_put(psy);
 	if (ret)
 		return;
 
-	for (range = 0; range < dynamic->num_ranges - 1; range++)
-		if (temp.intval <= dynamic->ranges[range].temp)
-			break;
-
 	mutex_lock(&bcl->param[BCL_VBAT_LVL0].state_trans_lock);
-	if (range == dynamic->current_range)
+	range = bcl_vbat_range_index(dynamic->ranges, dynamic->num_ranges, temp.intval);
+	for (i = 0; i < REG_MAX; i++) {
+		s64 adjusted = (s64)dynamic->ranges[range].mv[i] + compensation;
+
+		if (adjusted < bcl->desc->vcmp_thresh_base ||
+		    adjusted > bcl->desc->vcmp_thresh_max)
+			break;
+		mv[i] = adjusted;
+	}
+	/* A bad or unavailable compensation must not invalidate the base table. */
+	if (i != REG_MAX) {
+		dev_warn_ratelimited(bcl->dev, "Ignoring out-of-range VBAT compensation\n");
+		for (i = 0; i < REG_MAX; i++)
+			mv[i] = dynamic->ranges[range].mv[i];
+	}
+	if (range == dynamic->current_range &&
+	    !memcmp(mv, dynamic->applied_mv, sizeof(mv)))
 		goto unlock;
 
 	/* Keep the range invalid on failure so the next notification retries. */
 	dynamic->current_range = -1;
 	for (i = 0; i < REG_MAX; i++) {
-		int mv = dynamic->ranges[range].mv[i];
-
-		ret = bcl_set_adc_value(bcl, i, mv, &val);
+		ret = bcl_set_adc_value(bcl, i, mv[i], &val);
 		if (ret) {
 			dev_err_ratelimited(bcl->dev,
 				"Failed to set dynamic VBAT level %d: %d\n", i, ret);
 			goto unlock;
 		}
-		blocking_notifier_call_chain(&bcl_pmic5_notifier, i, &mv);
+		blocking_notifier_call_chain(&bcl_pmic5_notifier, i, &mv[i]);
 	}
+	memcpy(dynamic->applied_mv, mv, sizeof(mv));
 	dynamic->current_range = range;
 unlock:
 	mutex_unlock(&bcl->param[BCL_VBAT_LVL0].state_trans_lock);
@@ -694,56 +743,250 @@ static int bcl_battery_callback(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+static void bcl_restore_vbat_backup(struct bcl_dynamic_vbat *dynamic, bool automatic)
+{
+	struct mutex *lock = &dynamic->bcl->param[BCL_VBAT_LVL0].state_trans_lock;
+
+	mutex_lock(lock);
+	if ((automatic && dynamic->manual_triggered) ||
+	    (!automatic && dynamic->auto_triggered))
+		goto unlock;
+
+	if (automatic)
+		dynamic->auto_triggered = true;
+	else
+		dynamic->manual_triggered = true;
+	memcpy(dynamic->ranges, dynamic->backup,
+	       sizeof(*dynamic->ranges) * dynamic->num_ranges);
+	dynamic->current_range = -1;
+	queue_work(system_freezable_wq, &dynamic->work);
+unlock:
+	mutex_unlock(lock);
+}
+
+static void bcl_manual_restore_work(struct work_struct *work)
+{
+	struct bcl_dynamic_vbat *dynamic = container_of(to_delayed_work(work),
+					struct bcl_dynamic_vbat, manual_restore_work);
+
+	bcl_restore_vbat_backup(dynamic, false);
+}
+
+static void bcl_auto_restore_work(struct work_struct *work)
+{
+	struct bcl_dynamic_vbat *dynamic = container_of(to_delayed_work(work),
+					struct bcl_dynamic_vbat, auto_restore_work);
+
+	bcl_restore_vbat_backup(dynamic, true);
+}
+
+static int bcl_dynamic_vbat_show(struct seq_file *s, void *unused)
+{
+	struct bcl_dynamic_vbat *dynamic = s->private;
+	struct device_node *np = dynamic->bcl->dev->of_node;
+	const char *name = "Unknown";
+	int i;
+
+	if (of_device_is_compatible(np, "qcom,pmh0101-bcl-v5"))
+		name = "PMH0101";
+	else if (of_device_is_compatible(np, "qcom,pm8550-bcl-v5"))
+		name = "PM8550";
+	else if (of_device_is_compatible(np, "qcom,bcl-v5"))
+		name = "PMIH010X";
+
+	mutex_lock(&dynamic->bcl->param[BCL_VBAT_LVL0].state_trans_lock);
+	seq_printf(s, "PMIC Type: %s\nStatus:\n", name);
+	seq_printf(s, "  Manual trigger (write 1): %s\n",
+		   dynamic->manual_triggered ? "Yes" : "No");
+	seq_printf(s, "  Auto restore pending: %s\n",
+		   delayed_work_pending(&dynamic->auto_restore_work) ? "Yes" : "No");
+	seq_printf(s, "  Auto restore triggered: %s\n\nConfig values:\n",
+		   dynamic->auto_triggered ? "Yes" : "No");
+	for (i = 0; i < dynamic->num_ranges; i++)
+		seq_printf(s, "[%d] temp=%d, lv0=%d, lv1=%d, lv2=%d\n", i,
+			   dynamic->ranges[i].temp, dynamic->ranges[i].mv[0],
+			   dynamic->ranges[i].mv[1], dynamic->ranges[i].mv[2]);
+	mutex_unlock(&dynamic->bcl->param[BCL_VBAT_LVL0].state_trans_lock);
+	return 0;
+}
+
+static int bcl_dynamic_vbat_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, bcl_dynamic_vbat_show, pde_data(inode));
+}
+
+static ssize_t bcl_dynamic_vbat_write(struct file *file, const char __user *buf,
+				    size_t count, loff_t *ppos)
+{
+	struct bcl_dynamic_vbat *dynamic = pde_data(file_inode(file));
+	struct mutex *lock = &dynamic->bcl->param[BCL_VBAT_LVL0].state_trans_lock;
+	int val, ret;
+
+	if (!count || count >= 16)
+		return -EINVAL;
+	ret = kstrtoint_from_user(buf, count, 10, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	mutex_lock(lock);
+	if (!dynamic->auto_triggered) {
+		dynamic->manual_triggered = true;
+		mod_delayed_work(system_freezable_wq, &dynamic->manual_restore_work,
+				 msecs_to_jiffies(dynamic->manual_restore_delay_ms));
+	}
+	mutex_unlock(lock);
+	cancel_delayed_work_sync(&dynamic->auto_restore_work);
+	return count;
+}
+
+static const struct proc_ops bcl_dynamic_vbat_proc_ops = {
+	.proc_open = bcl_dynamic_vbat_open,
+	.proc_read = seq_read,
+	.proc_write = bcl_dynamic_vbat_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 static void bcl_dynamic_vbat_stop(void *data)
 {
 	struct bcl_dynamic_vbat *dynamic = data;
 
+	/* Drain proc writers and delayed producers before cancelling the worker. */
+	if (dynamic->proc_entry) {
+		proc_remove(dynamic->proc_entry);
+		mutex_lock(&bcl_proc_lock);
+		if (!--bcl_proc_users) {
+			proc_remove(bcl_proc_root);
+			bcl_proc_root = NULL;
+		}
+		mutex_unlock(&bcl_proc_lock);
+	}
 	power_supply_unreg_notifier(&dynamic->psy_nb);
+	cancel_delayed_work_sync(&dynamic->manual_restore_work);
+	cancel_delayed_work_sync(&dynamic->auto_restore_work);
 	cancel_work_sync(&dynamic->work);
+}
+
+static void bcl_dynamic_vbat_start(struct bcl_dynamic_vbat *dynamic, int id)
+{
+	char name[32];
+
+	if (dynamic->backup) {
+		mutex_lock(&bcl_proc_lock);
+		if (!bcl_proc_root)
+			bcl_proc_root = proc_mkdir("bcl_stat", NULL);
+		if (bcl_proc_root) {
+			snprintf(name, sizeof(name), "dynamic_vbat_%d", id);
+			dynamic->proc_entry = proc_create_data(name, 0664, bcl_proc_root,
+						&bcl_dynamic_vbat_proc_ops, dynamic);
+			if (dynamic->proc_entry)
+				bcl_proc_users++;
+			else if (!bcl_proc_users) {
+				proc_remove(bcl_proc_root);
+				bcl_proc_root = NULL;
+			}
+		}
+		mutex_unlock(&bcl_proc_lock);
+		if (!dynamic->proc_entry)
+			dev_warn(dynamic->bcl->dev, "Failed to create dynamic VBAT proc entry\n");
+		queue_delayed_work(system_freezable_wq, &dynamic->auto_restore_work,
+				   msecs_to_jiffies(dynamic->auto_restore_delay_ms));
+	}
+	queue_work(system_freezable_wq, &dynamic->work);
+}
+
+static int bcl_parse_vbat_table(struct bcl_device *bcl, const char *property,
+			       bool compensation, struct bcl_vbat_range **table,
+			       int *num_ranges)
+{
+	struct device_node *np = bcl->dev->of_node;
+	struct bcl_vbat_range *ranges;
+	int cells, count, i, j, ret;
+	u32 row[1 + REG_MAX];
+
+	cells = of_property_count_u32_elems(np, property);
+	if (cells <= 0 || cells % ARRAY_SIZE(row))
+		return -EINVAL;
+	count = cells / ARRAY_SIZE(row);
+	ranges = devm_kcalloc(bcl->dev, count, sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		for (j = 0; j < ARRAY_SIZE(row); j++) {
+			ret = of_property_read_u32_index(np, property,
+						 i * ARRAY_SIZE(row) + j, &row[j]);
+			if (ret)
+				return ret;
+		}
+		ranges[i].temp = (s32)row[0];
+		if (i && ranges[i].temp <= ranges[i - 1].temp)
+			return -EINVAL;
+		for (j = 0; j < REG_MAX; j++) {
+			if (!compensation &&
+			    (row[j + 1] < bcl->desc->vcmp_thresh_base ||
+			     row[j + 1] > bcl->desc->vcmp_thresh_max))
+				return -EINVAL;
+			ranges[i].mv[j] = (s32)row[j + 1];
+		}
+	}
+	*table = ranges;
+	*num_ranges = count;
+	return 0;
 }
 
 static int bcl_parse_dynamic_vbat(struct bcl_device *bcl)
 {
 	struct device_node *np = bcl->dev->of_node;
 	struct bcl_dynamic_vbat *dynamic;
-	int cells, count, i, j, ret;
-	u32 row[1 + REG_MAX];
+	struct bcl_vbat_range *backup;
+	int count, ret;
 
 	if (!of_property_read_bool(np, "bcl,support_dynamic_vbat"))
 		return 0;
 	if (bcl->bcl_monitor_type == BCL_MON_IBAT_ONLY)
 		return -EINVAL;
 
-	cells = of_property_count_u32_elems(np, "bcl,dynamic_vbat_data");
-	if (cells <= 0 || cells % ARRAY_SIZE(row))
-		return -EINVAL;
-	count = cells / ARRAY_SIZE(row);
-	dynamic = devm_kzalloc(bcl->dev, struct_size(dynamic, ranges, count), GFP_KERNEL);
+	dynamic = devm_kzalloc(bcl->dev, sizeof(*dynamic), GFP_KERNEL);
 	if (!dynamic)
 		return -ENOMEM;
+	ret = bcl_parse_vbat_table(bcl, "bcl,dynamic_vbat_data", false,
+				   &dynamic->ranges, &dynamic->num_ranges);
+	if (ret)
+		return ret;
 
-	for (i = 0; i < count; i++) {
-		for (j = 0; j < ARRAY_SIZE(row); j++) {
-			ret = of_property_read_u32_index(np, "bcl,dynamic_vbat_data",
-						 i * ARRAY_SIZE(row) + j, &row[j]);
-			if (ret)
-				return ret;
-		}
-		dynamic->ranges[i].temp = (s32)row[0];
-		if (i && dynamic->ranges[i].temp <= dynamic->ranges[i - 1].temp)
-			return -EINVAL;
-		for (j = 0; j < REG_MAX; j++) {
-			if (row[j + 1] < bcl->desc->vcmp_thresh_base ||
-			    row[j + 1] > bcl->desc->vcmp_thresh_max)
-				return -EINVAL;
-			dynamic->ranges[i].mv[j] = row[j + 1];
-		}
+	if (of_find_property(np, "bcl,dynamic_vbat_data_alt", NULL)) {
+		ret = bcl_parse_vbat_table(bcl, "bcl,dynamic_vbat_data_alt", false,
+					   &backup, &count);
+		if (!ret && count == dynamic->num_ranges)
+			dynamic->backup = backup;
+		else
+			dev_warn(bcl->dev, "Ignoring invalid alternate VBAT table\n");
 	}
+	if (of_property_read_bool(np, "bcl,support_dynamic_vbat_compensation")) {
+		ret = bcl_parse_vbat_table(bcl, "bcl,dynamic_vbat_data_compensation", true,
+					   &dynamic->compensation, &dynamic->num_compensation);
+		if (ret)
+			dev_warn(bcl->dev, "Ignoring invalid VBAT compensation table: %d\n", ret);
+	}
+	dynamic->manual_restore_delay_ms = 60000;
+	of_property_read_u32(np, "bcl,vbat_manual_restore_delay_ms",
+			     &dynamic->manual_restore_delay_ms);
+	dynamic->manual_restore_delay_ms = clamp_val(dynamic->manual_restore_delay_ms,
+						   10000, 60000);
+	dynamic->auto_restore_delay_ms = 100000;
+	of_property_read_u32(np, "bcl,vbat_auto_restore_delay_ms", &dynamic->auto_restore_delay_ms);
+	dynamic->auto_restore_delay_ms = clamp_val(dynamic->auto_restore_delay_ms,
+						 60000, 120000);
+
 	dynamic->bcl = bcl;
-	dynamic->num_ranges = count;
 	dynamic->current_range = -1;
 	dynamic->psy_nb.notifier_call = bcl_battery_callback;
 	INIT_WORK(&dynamic->work, bcl_dynamic_vbat_work);
+	INIT_DELAYED_WORK(&dynamic->manual_restore_work, bcl_manual_restore_work);
+	INIT_DELAYED_WORK(&dynamic->auto_restore_work, bcl_auto_restore_work);
 	bcl->dynamic_vbat = dynamic;
 	return 0;
 }
@@ -1506,7 +1749,7 @@ static int bcl_probe(struct platform_device *pdev)
 	bcl_stats_init(bcl_name, bcl_perph, MAX_BCL_LVL_COUNT);
 
 	if (bcl_perph->dynamic_vbat)
-		queue_work(system_freezable_wq, &bcl_perph->dynamic_vbat->work);
+		bcl_dynamic_vbat_start(bcl_perph->dynamic_vbat, bcl_device_ct - 1);
 
 	return 0;
 }

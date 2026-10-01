@@ -74,6 +74,7 @@ def _generate_ddk_target(
         defconfig = ":{}_defconfig".format(target_variant),
         kconfigs = [
             ":kconfig.msm.generated",
+            "//{}/oplus/bazel:kconfig.oplus.generated".format(SOC_MODULES_REPO_PATH),
             "//{}/oplus/kernel/charger/bazel:kconfig.oplus_chg.generated".format(SOC_MODULES_REPO_PATH),
         ],
         kernel_build = ":{}_base_kernel".format(target_variant),
