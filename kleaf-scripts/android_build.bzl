@@ -199,6 +199,10 @@ def define_single_android_build(
         kernel_build = "{}_dtb_build".format(stem),
         base_kernel_images = "{}_images".format(base_kernel),
         dtbo_srcs = [":{}_dtb_build/{}".format(stem, dtbo) for dtbo in dtbo_list] if dtbo_list else None,
+        dtbo_config = select({
+            ":dtbo_config_unset": None,
+            "//conditions:default": ":dtbo_config",
+        }),
         build_vendor_boot = True,
         build_vendor_kernel_boot = False,
         build_initramfs = True,
